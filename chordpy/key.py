@@ -14,7 +14,7 @@ class Key:
         return randint(0, 1000000000)
 
     @staticmethod
-    def between(key, fr, to) -> bool:
+    def between(key: int, fr: int, to: int) -> bool:
         """
         Checks if a key is between _from_ and _to_ or equal to _to_ on the ring.
 

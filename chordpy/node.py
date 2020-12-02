@@ -2,16 +2,22 @@ import time
 import types
 import socket
 import selectors
+from ast import literal_eval
+from key import Key
 
 
 class Node:
     def __init__(self, id: int, port: int) -> None:
         self.id = id
+        self.predecessor = None
+        self.successor = None
 
         # Determine own IPv4 address
         hostname = socket.gethostname()
         self.ip = socket.gethostbyname(hostname)
         print(f"Hostname: {hostname} [{self.ip}]")
+        print(f"ID: {self.id}")
+        self.port = port
 
         # Init a non-blocking listening socket
         my_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -25,56 +31,64 @@ class Node:
         self.slctrs = slctrs
 
     def join(self, dest, retries=3):
+        """
+        Joins a ring at the given destination _dest_.
+        _retries_ is the number of connection attempts to make.
+        """
         remote, port = dest
         remote_ip = socket.gethostbyname(remote)
         print(f"Connecting to ring at {dest}")
         remote_id = self.id
         if remote_ip != self.ip:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             payload = f"key:{self.id}".encode("utf-8")
             retry_count = 0
             data = None
-            while retry_count < retries:
-                try:
-                    sock.connect((remote_ip, port))
-                    # Ask for remote's id
-                    sock.sendall(payload)
-                    data = sock.recv(1024).decode("utf-8")
-                    break
-                except socket.error as e:
-                    print("Connection failed, reason:", e)
-                    time.sleep(1)
-                    retry_count += 1
-                    print(f"Retrying to join... (count: {retry_count})")
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                while retry_count < retries:
+                    try:
+                        sock.connect((remote_ip, port))
+                        # Ask for remote's id
+                        sock.sendall(payload)
+                        data = sock.recv(1024).decode("utf-8")
+                        break
+                    except socket.error as e:
+                        print("Connection failed, reason:", e)
+                        time.sleep(1)
+                        retry_count += 1
+                        print(f"Retrying to join... (count: {retry_count})")
 
-            sock.close()
             if data:
                 remote_id = int(data)
             else:
-                raise Exception("Host didn't send it's key!")
+                raise Exception(f"{remote} didn't send me its id!")
 
-            # Save my successor
+        # Save my successor
         self.successor = (remote_id, remote_ip)
         print(f"Succesfully joined the ring at {dest}.")
 
-    def run(self):
+    def run(self, stabilize_every=2):
         """
         Starts the main event loop of the node.
+        _stabilize_every_ denotes the period in seconds after which this node tries to stabilize the ring.
         """
-        print("Starting event loop")
+        print("Starting main event loop")
         try:
             while True:  # Main event loop
                 # Wait for new event(s)
-                events = self.slctrs.select(timeout=None)
+                start_time = time.time()
+                events = self.slctrs.select(timeout=stabilize_every)
                 for key, mask in events:
                     if key.data is None:
                         # Accept new connection
                         self.accept(key.fileobj)
                     else:
                         # Respond to existing connection
-                        self.respond(key, mask)
-        except Exception as e:
-            print("\nInterrupted, exiting...", e)
+                        self.process(key, mask)
+
+                elapsed_time = time.time() - start_time
+                if elapsed_time >= stabilize_every:
+                    print("Running stabilization...")
+                    self.create_request(self.successor[1], "request", str(self.id))
         finally:
             self.slctrs.close()
 
@@ -85,61 +99,144 @@ class Node:
         conn, addr = sock.accept()
         conn.setblocking(False)
         print("New connection from", addr)
-        data = types.SimpleNamespace(addr=addr, msg=b"", cmd="", done=False)
+        data = types.SimpleNamespace(addr=addr, cmd="", msg=b"", read=False)
         events = selectors.EVENT_READ | selectors.EVENT_WRITE  # Possible events
         self.slctrs.register(conn, events, data=data)
 
-    def respond(self, key, mask):
+    def process(self, key, mask):
+        """
+        Reads received bytes and stores them in the connection namespace (max of 1024 bytes at a time). After all the bytes are read, responds accordingly to the request and closes the connection.
+        """
         sock = key.fileobj
         data = key.data
-        if mask & selectors.EVENT_READ:
+        if mask & selectors.EVENT_READ:  # Handle events that need reading
             recv_data = sock.recv(1024)
-            if recv_data:
-                # Extract the "command" of this message.
-                # It's always the first few bytes of a message before a colon character
-                if not data.cmd:
-                    data.cmd, msg = recv_data.decode("utf-8").split(":", 1)
-                    data.msg = msg.encode("utf-8")
-                # If the cmd is already set, simply store the rest of the message
+            if hasattr(data, "sent") and data.sent:  # Handle response
+                if recv_data:
+                    data.res += recv_data
+
+                if len(recv_data) < 1024:
+                    print(f"Closing connection to: {data.addr}")
+                    self.slctrs.unregister(sock)
+                    sock.close()
+                    cmd = data.req.split(":")[0]
+                    msg = data.res.decode("utf-8")
+                    self.handle_response(cmd, msg)
+
+            elif hasattr(data, "read") and not data.read:
+                if recv_data:
+                    # Extract the "command" of this request
+                    if not data.cmd:
+                        data.cmd, msg = recv_data.decode("utf-8").split(":", 1)
+                        data.msg = msg.encode("utf-8")
+                    # If the cmd is already set, simply store the rest of the message
+                    else:
+                        data.msg += recv_data
+
+                    if len(recv_data) < 1024:  # Check if this was the last "chunk"
+                        data.read = True
                 else:
-                    data.msg += recv_data
+                    print(f"Closing connection from: {data.addr}")
+                    self.slctrs.unregister(sock)
+                    sock.close()
 
-                if len(recv_data) < 1024:  # Check if this was the last "chunk"
-                    data.done = True
+        if mask & selectors.EVENT_WRITE:  # Handle events that need writing
+            if hasattr(data, "sent") and not data.sent:  # Handle sending
+                print(f"Sending request {data.req} to {data.addr}")
+                sock.send(data.req.encode("utf-8"))
+                data.sent = True  # Marks this message as "sent"
 
-            else:  # No more data to read
-                print("Closing connection to", data.addr, "(end of data)")
-                self.slctrs.unregister(sock)
-                sock.close()
+            elif hasattr(data, "read") and data.read:  # Handle responding
+                msg = data.msg.decode("utf-8")
+                res = self.handle_request(data)
+                if res is not None:
+                    print(
+                        f"Responding to request _{data.cmd}_ with {res}. [{data.addr}]"
+                    )
+                    sock.send(res.encode("utf-8"))
+                data.read = False  # Marks this message as "processed"
 
-        if (mask & selectors.EVENT_WRITE) and data.done:  # Check also for done reading
-            msg = data.msg.decode("utf-8")
-            res = self.handle_message(data.cmd, msg)
-            sock.send(res.encode("utf-8"))
-            data.done = False  # Marks this message as "processed"
-
-    def handle_message(self, cmd: str, message: str) -> str:
+    def handle_request(self, data: types.SimpleNamespace) -> str:
         """
-        Top-level function to determine how to handle each type of message that this node receives.
+        Top-level function to determine how to handle each type of request that this node receives.
 
-        Return value is a message that is a response to the received message.
+        Returns a (string) message that is a response to the received message.
         """
-        if cmd == "key":
-            # Send my key to the requester
+        if data.cmd == "key":  # Respond to a query of my key
             return str(self.id)
-        elif cmd == "notify":
-            #
-            pass
-        elif cmd == "request":
-            pass
-        elif cmd == "status":
-            pass
+        if data.cmd == "notify":  # Handle a predecessor proposal
+            peer_id = int(data.msg.decode("utf-8"))
+            peer_ip = data.addr[0]
+            if self.predecessor is None or Key.between(
+                peer_id, self.predecessor[0], self.id
+            ):
+                self.predecessor = (peer_id, peer_ip)
+                print("I've got a new peer,", (peer_id, peer_ip))
+            return None
 
-    def stabilize(self, pred, id, succ):
-        key, id = succ
+        if data.cmd == "request":  # Respond to a query of my predecessor
+            return str(self.predecessor)
+
+    def handle_response(self, cmd: str, msg: str) -> None:
+        """
+        Top-level function to determine how to handle each type of response that this node receives.
+        """
+        if cmd == "request":  # Run stabilization
+            self.stabilize(msg)
+
+    def create_request(self, ip: str, cmd: str, msg: str) -> None:
+        """
+        Registers a new request to be sent.
+
+        _ip_ an ip address of a peer to connect to.
+
+        _cmd_ a command to which the peer can respond to.
+
+        _msg_ the payload of the command.
+        """
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setblocking(False)
+        to = (ip, self.port)
+        sock.connect_ex(to)
+        events = selectors.EVENT_READ | selectors.EVENT_WRITE
+        data = types.SimpleNamespace(addr=to, req=f"{cmd}:{msg}", res=b"", sent=False)
+        self.slctrs.register(sock, events, data=data)
+
+    def stabilize(self, data: str) -> None:
+        """
+        Try to stabilize the ring on my part by notifying my successor, or successor's predecessor, of my existence. Creates a new request, if necessary.
+
+        _data_ is my current successor's predecessor.
+        """
+        pred = literal_eval(data)  # Should either be None or a tuple of size two
+        print(f"My successor's ({self.successor[0]}) predecessor is {pred}")
+
         if pred is None:
-            # Notify succ of our existence
-            pass
-        elif pred == self.id:
-            pass  # Do nothing
-        # elif pred
+            # My successor has no predecessor
+            # Notify of my existence:
+            self.create_request(self.successor[1], "notify", str(self.id))
+
+        elif isinstance(pred, tuple) and len(pred) == 2:
+            # My successor has a predecessor...
+            pred_id = int(pred[0])
+            if pred_id == self.successor[0]:
+                # ...but it's pointing to itself.
+                # Notify of my existence:
+                self.create_request(self.successor[1], "notify", str(self.id))
+            else:
+                # ...and it's pointing to some other node.
+                # > Determine where I am in respect to my current
+                # > successor and my successor's predecessor...
+                if Key.between(pred_id, self.id, self.successor[0]):
+                    # ...I am before both of them.
+                    self.successor = pred
+                    self.create_request(self.successor[1], "request", str(self.id))
+                else:
+                    # ...I am between them.
+                    # Notify of my existence:
+                    self.create_request(self.successor[1], "notify", str(self.id))
+        else:
+            print(f"Received malformed data: {pred}, when trying to stabilize.")
+
+    def notify(self):
+        pass
